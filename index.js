@@ -7,14 +7,14 @@
 
 "use strict";
 
+require('itsa-jsext/lib/object');
+
 var Boom = require('boom');
 var Hoek = require('hoek');
-
 
 // Declare internals
 
 var internals = {};
-
 
 exports.register = function (server, options, next) {
 
@@ -67,43 +67,71 @@ internals.implementation = function (server, options) {
 
     server.state(settings.cookie, cookieOptions);
 
+    server.ext('onPreResponse', function (request, reply) {
+        var response = request.response;
+        if (response.isBoom && response.output && (response.output.statusCode===403)) {
+            return reply.reactview(settings.loginView, {__sendRequireId__: true});
+        }
+        return reply.continue();
+    });
+
     server.ext('onPreAuth', function (request, reply) {
         request.auth.retries = settings.retries;
         request.auth.session = {
-            set: function (session, value) {
-
-                if (arguments.length > 1) {
-                    var key = session;
-                    Hoek.assert(key && typeof key === 'string', 'Invalid session key');
-                    session = request.auth.artifacts;
-                    Hoek.assert(session, 'No active session to apply key to');
-
-                    session[key] = value;
-                    return reply.state(settings.cookie, session);
+            set: function (session, ttl) {
+                var options;
+                if (typeof session==='object') {
+                    if (typeof ttl==='number') {
+                        session.ttl = ttl;
+                        options = {
+                            ttl: ttl
+                        };
+                    }
+                    reply.state(settings.cookie, session, options);
                 }
-
-                Hoek.assert(session && typeof session === 'object', 'Invalid session');
-                request.auth.artifacts = session;
-                reply.state(settings.cookie, session);
+            },
+            update: function (sessionid, value, ttl) {
+                var session;
+                if ((typeof sessionid==='string') && (typeof value==='object')) {
+                    session = request.state[sessionid];
+                    if (session) {
+                        session.itsa_merge(value, {force: true});
+                        if (typeof ttl==='number') {
+                            session.ttl = ttl;
+                        }
+                        else {
+                            ttl = session.ttl;
+                        }
+                        reply.state(settings.cookie, session, ttl && {ttl: ttl});
+                    }
+                }
             },
             clear: function (key) {
-
+                var session, options;
                 if (arguments.length) {
-                    Hoek.assert(key && typeof key === 'string', 'Invalid session key');
-                    var session = request.auth.artifacts;
-                    Hoek.assert(session, 'No active session to clear key from');
-                    delete session[key];
-                    return reply.state(settings.cookie, session);
+                    if (typeof key==='string') {
+                        session = request.state[settings.cookie];
+                        if (session) {
+                            delete session[key];
+                            if (session.ttl) {
+                                options = {
+                                    ttl: session.ttl
+                                };
+                            }
+                            reply.state(settings.cookie, session, options);
+                        }
+                    }
                 }
-
-                request.auth.artifacts = null;
-                reply.unstate(settings.cookie);
+                else {
+                    reply.unstate(settings.cookie);
+                }
             },
             ttl: function (msecs) {
-
-                var session = request.auth.artifacts;
-                Hoek.assert(session, 'No active session to modify ttl on');
-                reply.state(settings.cookie, session, { ttl: msecs });
+                var session = request.state[settings.cookie];
+                if (session) {
+                    session.ttl=msecs;
+                    reply.state(settings.cookie, session, { ttl: msecs });
+                }
             }
         };
 
@@ -112,27 +140,33 @@ internals.implementation = function (server, options) {
 
     var scheme = {
         authenticate: function (request, reply) {
+            request._itsaAuthenticationId = settings.cookie;
 
             var validate = function () {
                 // Check cookie
                 var session = request.state[settings.cookie];
                 if (!session) {
-                    reply.reactview(settings.loginView);
+                    reply.reactview(settings.loginView, {__sendRequireId__: true});
                 }
                 else {
-                    settings.validateCookie.call(request, session, function (err, isValid, credentials) {
+                    settings.validateCookie.call(request, session, function (err, isValid, artifacts) {
+                        var options;
                         if (err || !isValid) {
                             if (settings.clearInvalid) {
                                 reply.unstate(settings.cookie);
                             }
-                            reply.reactview(settings.loginView);
-                            return;
+                            reply.reactview(settings.loginView, {__sendRequireId__: true});
                         }
-
-                        // keepAlive:
-                        reply.state(settings.cookie, session);
-
-                        return reply.continue({ credentials: credentials || session, artifacts: session });
+                        else {
+                            // keepAlive:
+                            if (session.ttl) {
+                                options = {
+                                    ttl: session.ttl
+                                };
+                            }
+                            reply.state(settings.cookie, session, options);
+                            reply.continue({credentials: session, artifacts: artifacts});
+                        }
                     });
                 }
             };
